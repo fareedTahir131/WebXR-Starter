@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover" />
+  <title>WebXR GLB Tap-to-Place</title>
+  <style>
+    html,body { height:100%; margin:0; background:#000; overflow:hidden; }
+    #info {
+      position: absolute; left: 12px; top: 12px; z-index: 2;
+      color: #fff; font-family: Arial, sans-serif; font-size: 13px;
+      background: rgba(0,0,0,0.4); padding: 8px 10px; border-radius: 6px;
+      max-width: 95%;
+    }
+    #startHint { display:block; margin-top:6px; opacity:0.9; }
+    canvas { display:block; width:100%; height:100%; touch-action: none; }
+  </style>
+</head>
+<body>
+  <div id="info">
+    Tap <strong>Start AR</strong>, move the camera to find a flat surface. A reticle appears — tap the screen to place the model.
+    <div id="startHint">Model: <span id="modelName">your-model.glb</span></div>
+  </div>
+
+  <script type="module">
+    // ----- CONFIG -----
+    // Replace with your model path. If hosting on GitHub Pages put the .glb in the repo root or public folder.
+    const MODEL_URL = './lowpoly_biker.glb'; // <-- change this to your GLB path or remote URL
+    const MODEL_SCALE = 0.5;         // scale factor to tune the model size
+    const MODEL_ROTATION_DEGREES = 0; // rotate placed model around Y if needed
+
+    // ----- IMPORTS -----
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.module.js';
+    import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.152.2/examples/jsm/loaders/GLTFLoader.js';
+    import { ARButton } from 'https://cdn.jsdelivr.net/npm/three@0.152.2/examples/jsm/webxr/ARButton.js';
+
+    // ----- SCENE / RENDERER -----
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputEncoding = THREE.sRGBEncoding;
+    renderer.xr.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    // ----- LIGHT -----
+    const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1.0);
+    scene.add(light);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.6);
+    dir.position.set(0.5, 2, 0.3);
+    scene.add(dir);
+
+    // ----- RETICLE (placement indicator) -----
+    const reticle = new THREE.Mesh(
+      new THREE.RingGeometry(0.08, 0.12, 32).rotateX(-Math.PI / 2),
+      new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false, depthWrite: false, opacity: 0.9, transparent: true })
+    );
+    reticle.matrixAutoUpdate = false;
+    reticle.visible = false;
+    scene.add(reticle);
+
+    // ----- MODEL LOADING -----
+    let gltfScene = null;
+    const loader = new GLTFLoader();
+    document.getElementById('modelName').textContent = MODEL_URL;
+
+    loader.load(
+      MODEL_URL,
+      (gltf) => {
+        gltfScene = gltf.scene;
+        // apply initial scaling so clones are already properly scaled
+        gltfScene.scale.setScalar(MODEL_SCALE);
+        // pre-rotate if needed
+        gltfScene.rotation.y = THREE.MathUtils.degToRad(MODEL_ROTATION_DEGREES);
+        console.log('GLB loaded');
+      },
+      (xhr) => {
+        // progress (optional)
+        // console.log( (xhr.loaded / xhr.total * 100) + '% loaded' );
+      },
+      (err) => {
+        console.error('Error loading GLB:', err);
+        alert('Failed to load model. Check console and MODEL_URL.');
+      }
+    );
+
+    // ----- AR BUTTON -----
+    document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['hit-test'] }));
+
+    // ----- HIT TEST SETUP -----
+    let hitTestSource = null;
+    let viewerSpace = null;
+    let localReferenceSpace = null;
+
+    function onSessionStart() {
+      const session = renderer.xr.getSession();
+
+      session.requestReferenceSpace('viewer').then((refSpace) => {
+        viewerSpace = refSpace;
+        session.requestHitTestSource({ space: viewerSpace }).then((source) => {
+          hitTestSource = source;
+        });
+      });
+
+      session.requestReferenceSpace('local').then((ref) => {
+        localReferenceSpace = ref;
+      });
+
+      session.addEventListener('end', onSessionEnd);
+    }
+
+    function onSessionEnd() {
+      hitTestSource = null;
+      viewerSpace = null;
+      localReferenceSpace = null;
+      reticle.visible = false;
+    }
+
+    renderer.xr.addEventListener('sessionstart', onSessionStart);
+
+    // ----- CONTROLLER: handle tap/select -----
+    const controller = renderer.xr.getController(0);
+    controller.addEventListener('select', onSelect);
+    scene.add(controller);
+
+    function onSelect() {
+      if (!reticle.visible) return;
+      if (!gltfScene) {
+        console.warn('Model not yet loaded.');
+        return;
+      }
+
+      // clone the loaded model so we can place multiple if needed
+      const placed = gltfScene.clone(true);
+
+      // derive position/rotation from reticle.matrix
+      const matrix = new THREE.Matrix4();
+      matrix.copy(reticle.matrix);
+
+      placed.position.setFromMatrixPosition(matrix);
+      placed.quaternion.setFromRotationMatrix(matrix);
+
+      // optional: place model precisely on top of reticle (y offset)
+      // if your model's origin is not at the base, adjust here:
+      // placed.position.y += 0.01;
+
+      scene.add(placed);
+    }
+
+    // ----- RENDER LOOP -----
+    renderer.setAnimationLoop((timestamp, frame) => {
+      if (frame) {
+        const referenceSpace = localReferenceSpace;
+        const session = renderer.xr.getSession();
+
+        if (hitTestSource && referenceSpace) {
+          const hitTestResults = frame.getHitTestResults(hitTestSource);
+
+          if (hitTestResults.length > 0) {
+            const hit = hitTestResults[0];
+            const pose = hit.getPose(referenceSpace);
+            // set reticle matrix
+            reticle.visible = true;
+            reticle.matrix.fromArray(pose.transform.matrix);
+          } else {
+            reticle.visible = false;
+          }
+        }
+      }
+
+      renderer.render(scene, camera);
+    });
+
+    // ----- WINDOW RESIZE -----
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ----- Fallback note for devices that do not support WebXR -----
+    if (navigator.xr === undefined) {
+      console.warn('WebXR not available on this device/browser.');
+      // ARButton will still produce a button; when pressed it will show a message if not supported.
+    }
+  </script>
+</body>
+</html>
